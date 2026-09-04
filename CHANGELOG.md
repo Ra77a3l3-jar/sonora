@@ -7,6 +7,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Seek a few seconds back or forward with the left and right arrow keys, or the buttons beside
+  play/pause.
+
 ## [0.31.0] - 2026-09-05
 
 ### Added
