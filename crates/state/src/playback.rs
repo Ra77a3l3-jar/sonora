@@ -64,6 +64,7 @@ const SKIP_DEBOUNCE: Duration = Duration::from_millis(250);
 const RESTART_WINDOW: Duration = Duration::from_secs(3);
 const KEY_COOLDOWN: Duration = Duration::from_secs(6);
 const RESUME_STEP: Duration = Duration::from_secs(5);
+const SEEK_STEP: Duration = Duration::from_secs(5);
 const TAPER_DB: f32 = 50.;
 const LOCAL_FAVORITES: &str = "favorites";
 const SIMILAR_LIMIT: usize = 20;
@@ -1242,6 +1243,26 @@ impl Playback {
 
         let position = Duration::from_secs_f32(total.as_secs_f32() * fraction.clamp(0., 1.));
         self.seek(position, cx);
+    }
+
+    pub fn seek_by(&mut self, step: Duration, forward: bool, cx: &mut Context<Self>) {
+        let Some(end) = self.track.as_ref().map(|track| track.duration) else {
+            return;
+        };
+        let at = self.live_position();
+        let target = match forward {
+            true => at.saturating_add(step).min(end),
+            false => at.saturating_sub(step),
+        };
+        self.seek(target, cx);
+    }
+
+    pub fn seek_back(&mut self, cx: &mut Context<Self>) {
+        self.seek_by(SEEK_STEP, false, cx);
+    }
+
+    pub fn seek_forward(&mut self, cx: &mut Context<Self>) {
+        self.seek_by(SEEK_STEP, true, cx);
     }
 
     pub fn state(&self) -> &PlaybackState {
