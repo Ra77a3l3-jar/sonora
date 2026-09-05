@@ -65,6 +65,8 @@ const RESTART_WINDOW: Duration = Duration::from_secs(3);
 const KEY_COOLDOWN: Duration = Duration::from_secs(6);
 const RESUME_STEP: Duration = Duration::from_secs(5);
 const SEEK_STEP: Duration = Duration::from_secs(5);
+const SEEK_CATCHUP: Duration = Duration::from_millis(400);
+const SEEK_HOLD: Duration = Duration::from_secs(2);
 const TAPER_DB: f32 = 50.;
 const LOCAL_FAVORITES: &str = "favorites";
 const SIMILAR_LIMIT: usize = 20;
@@ -118,6 +120,13 @@ impl LiveClock {
         let elapsed = now.saturating_duration_since(since).as_secs_f64();
         let blend = (elapsed / self.settle).clamp(0., 1.);
         shifted(self.base, elapsed + self.correction * blend)
+    }
+}
+
+fn away(left: Duration, right: Duration) -> Duration {
+    match left >= right {
+        true => left - right,
+        false => right - left,
     }
 }
 
@@ -277,6 +286,7 @@ pub struct Playback {
     refused: Option<Refusal>,
     resume_at: Option<Duration>,
     seek_on_play: Option<Duration>,
+    sought: Option<(Duration, Instant)>,
     resume_ready: bool,
     awaiting_reconnect: bool,
     stored: Duration,
@@ -353,6 +363,7 @@ impl Playback {
             refused: None,
             resume_at: None,
             seek_on_play: None,
+            sought: None,
             resume_ready: false,
             awaiting_reconnect: false,
             stored: Duration::ZERO,
@@ -1218,6 +1229,7 @@ impl Playback {
             }
             self.position = position;
             self.clock.reset(position, false);
+            self.sought = Some((position, Instant::now()));
             self.remember(true, cx);
             cx.notify();
             return;
@@ -1227,6 +1239,7 @@ impl Playback {
             self.position = position;
             self.clock
                 .reset(position, self.state == PlaybackState::Playing);
+            self.sought = Some((position, Instant::now()));
             cx.notify();
         }
     }
@@ -1263,6 +1276,13 @@ impl Playback {
 
     pub fn seek_forward(&mut self, cx: &mut Context<Self>) {
         self.seek_by(SEEK_STEP, true, cx);
+    }
+
+    fn holding_seek(&self, reported: Duration) -> bool {
+        let Some((target, since)) = self.sought else {
+            return false;
+        };
+        since.elapsed() < SEEK_HOLD && away(reported, target) > SEEK_CATCHUP
     }
 
     pub fn state(&self) -> &PlaybackState {
@@ -1525,7 +1545,9 @@ impl Playback {
                 self.clock.reset(position, false);
                 self.remember(true, cx);
             }
+            BackendEvent::Position(position) if self.holding_seek(position) => {}
             BackendEvent::Position(position) => {
+                self.sought = None;
                 self.position = position;
                 match self.state == PlaybackState::Playing {
                     true => self.clock.correct(position),
@@ -1602,6 +1624,7 @@ impl Playback {
             self.clock.reset(Duration::ZERO, false);
             self.resume_at = None;
             self.seek_on_play = None;
+            self.sought = None;
             self.resume_ready = false;
             self.awaiting_reconnect = false;
             self.stored = Duration::ZERO;
