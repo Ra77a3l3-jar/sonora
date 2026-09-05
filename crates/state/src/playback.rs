@@ -64,7 +64,6 @@ const SKIP_DEBOUNCE: Duration = Duration::from_millis(250);
 const RESTART_WINDOW: Duration = Duration::from_secs(3);
 const KEY_COOLDOWN: Duration = Duration::from_secs(6);
 const RESUME_STEP: Duration = Duration::from_secs(5);
-const SEEK_STEP: Duration = Duration::from_secs(5);
 const SEEK_CATCHUP: Duration = Duration::from_millis(400);
 const SEEK_HOLD: Duration = Duration::from_secs(2);
 const TAPER_DB: f32 = 50.;
@@ -172,6 +171,46 @@ pub enum Repeat {
     Off,
     All,
     One,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SeekStep {
+    Five,
+    #[default]
+    Ten,
+    Thirty,
+}
+
+impl SeekStep {
+    pub const ALL: [Self; 3] = [Self::Five, Self::Ten, Self::Thirty];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Five => "5",
+            Self::Ten => "10",
+            Self::Thirty => "30",
+        }
+    }
+
+    pub fn secs(self) -> u16 {
+        match self {
+            Self::Five => 5,
+            Self::Ten => 10,
+            Self::Thirty => 30,
+        }
+    }
+
+    pub fn duration(self) -> Duration {
+        Duration::from_secs(u64::from(self.secs()))
+    }
+
+    pub fn from_secs(secs: u16) -> Self {
+        match secs {
+            5 => Self::Five,
+            30 => Self::Thirty,
+            _ => Self::Ten,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -1271,11 +1310,13 @@ impl Playback {
     }
 
     pub fn seek_back(&mut self, cx: &mut Context<Self>) {
-        self.seek_by(SEEK_STEP, false, cx);
+        let step = self.settings.read(cx).seek_step().duration();
+        self.seek_by(step, false, cx);
     }
 
     pub fn seek_forward(&mut self, cx: &mut Context<Self>) {
-        self.seek_by(SEEK_STEP, true, cx);
+        let step = self.settings.read(cx).seek_step().duration();
+        self.seek_by(step, true, cx);
     }
 
     fn holding_seek(&self, reported: Duration) -> bool {
