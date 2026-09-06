@@ -505,7 +505,7 @@ fn refusal(_error: &anyhow::Error) -> PlaybackEvent {
 }
 
 async fn fetch(api: &Session, id: &str) -> Result<Loaded> {
-    let data = api.preview(id).await?;
+    let data = api.audio(id).await?;
     Ok(Loaded {
         data: Arc::new(data),
         loudness_db: None,
@@ -515,11 +515,18 @@ async fn fetch(api: &Session, id: &str) -> Result<Loaded> {
 
 fn decode(data: Arc<Vec<u8>>) -> Result<impl rodio::Source + Send + 'static> {
     let length = data.len() as u64;
+    let cursor = Cursor::new(Bytes(data.clone()));
     rodio::Decoder::builder()
-        .with_data(Cursor::new(Bytes(data)))
+        .with_data(cursor)
         .with_byte_len(length)
         .with_seekable(true)
         .build()
+        .or_else(|_| {
+            rodio::Decoder::builder()
+                .with_data(Cursor::new(Bytes(data)))
+                .with_byte_len(length)
+                .build()
+        })
         .context("cannot decode audio")
 }
 

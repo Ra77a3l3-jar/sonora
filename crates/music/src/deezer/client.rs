@@ -1,12 +1,15 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
+use reqwest::Url;
+use reqwest::cookie::Jar;
 use reqwest::Client;
-use serde_json::Value;
+use serde_json::{Value, json};
 
-use crate::deezer::wire;
+
+use crate::deezer::{stream, wire};
 use crate::{
     Album, AlbumDetail, Artist, ArtistProfile, Genre, GenreDetail, HomeFeed, MediaKind, MusicApi,
     Playlist, PlaylistDetail, SavedArtist, Track, UserProfile,
@@ -14,12 +17,16 @@ use crate::{
 
 const API: &str = "https://api.deezer.com";
 const GATEWAY: &str = "https://www.deezer.com/ajax/gw-light.php";
+const MEDIA: &str = "https://media.deezer.com/v1/get_url";
 const PORTRAIT_LIMIT: usize = 24;
+const AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 #[derive(Clone)]
 pub struct Session {
     http: Client,
     arl: Option<String>,
+    api_token: Arc<Mutex<String>>,
+    license_token: Arc<Mutex<String>>,
 }
 
 pub struct DeezerClient {
@@ -382,27 +389,41 @@ impl MusicApi for DeezerClient {
 
 impl Session {
     pub fn new(arl: Option<String>) -> Self {
+        let jar = Jar::default();
+        if let Some(arl) = &arl
+            && let Ok(url) = Url::parse("https://www.deezer.com")
+        {
+            jar.add_cookie_str(
+                &format!("arl={arl}; Domain=.deezer.com; Path=/"),
+                &url,
+            );
+        }
         Self {
             http: Client::builder()
-                .user_agent("Sonora/0.31")
+                .user_agent(AGENT)
+                .cookie_provider(Arc::new(jar))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             arl,
+            api_token: Arc::new(Mutex::new(String::new())),
+            license_token: Arc::new(Mutex::new(String::new())),
         }
     }
 
     pub async fn identify(&self) -> Result<UserProfile> {
-        let Some(arl) = &self.arl else {
+        let Some(_arl) = &self.arl else {
             return Ok(UserProfile {
                 id: String::new(),
                 display_name: "Deezer".to_string(),
             });
         };
-        let url = format!("{GATEWAY}?method=deezer.getUserData&input=3&api_version=1.0&api_token=");
+        let url = format!(
+            "{GATEWAY}?method=deezer.getUserData&input=3&api_version=1.0&api_token=null"
+        );
         let body: Value = self
             .http
-            .get(url)
-            .header("Cookie", format!("arl={arl}"))
+            .post(url)
+            .json(&json!({}))
             .send()
             .await
             .context("cannot reach deezer")?
@@ -422,6 +443,21 @@ impl Session {
         if id == "0" {
             bail!("the ARL was not accepted");
         }
+        if let Some(token) = results
+            .get("checkForm")
+            .or_else(|| results.get("checkFormLogin"))
+            .and_then(Value::as_str)
+        {
+            *self.api_token.lock().expect("deezer api token") = token.to_string();
+        }
+        if let Some(token) = user
+            .get("OPTIONS")
+            .and_then(|options| options.get("license_token"))
+            .or_else(|| results.get("LICENSE_TOKEN"))
+            .and_then(Value::as_str)
+        {
+            *self.license_token.lock().expect("deezer license") = token.to_string();
+        }
         let display_name = user
             .get("BLOG_NAME")
             .or_else(|| user.get("name"))
@@ -432,7 +468,123 @@ impl Session {
         Ok(UserProfile { id, display_name })
     }
 
-    pub async fn preview(&self, track_id: &str) -> Result<Vec<u8>> {
+    pub async fn audio(&self, track_id: &str) -> Result<Vec<u8>> {
+        if self.arl.is_some() {
+            match self.stream(track_id).await {
+                Ok(data) if !data.is_empty() => return Ok(data),
+                Ok(_) => log::warn!("deezer: stream for {track_id} was empty"),
+                Err(error) => log::warn!("deezer: cannot stream {track_id}: {error:#}"),
+            }
+        }
+        self.preview(track_id).await
+    }
+
+    async fn stream(&self, track_id: &str) -> Result<Vec<u8>> {
+        let token = self
+            .api_token
+            .lock()
+            .expect("deezer api token")
+            .clone();
+        let license = self
+            .license_token
+            .lock()
+            .expect("deezer license")
+            .clone();
+        if token.is_empty() || license.is_empty() {
+            let _ = self.identify().await?;
+        }
+        let token = self
+            .api_token
+            .lock()
+            .expect("deezer api token")
+            .clone();
+        let license = self
+            .license_token
+            .lock()
+            .expect("deezer license")
+            .clone();
+        if token.is_empty() || license.is_empty() {
+            bail!("deezer sent no stream tokens");
+        }
+        let id: u64 = track_id.parse().context("track id is not a number")?;
+        let listed = self
+            .gateway("song.getListData", json!({ "sng_ids": [id] }), &token)
+            .await?;
+        let song = listed
+            .get("data")
+            .and_then(Value::as_array)
+            .or_else(|| listed.as_array())
+            .and_then(|songs| songs.first())
+            .or(Some(&listed))
+            .context("deezer sent no track token")?;
+        let track_token = song
+            .get("TRACK_TOKEN")
+            .and_then(Value::as_str)
+            .context("deezer sent no track token")?;
+        let body = json!({
+            "license_token": license,
+            "media": [{
+                "type": "FULL",
+                "formats": [
+                    {"cipher": "BF_CBC_STRIPE", "format": "MP3_320"},
+                    {"cipher": "BF_CBC_STRIPE", "format": "MP3_128"}
+                ]
+            }],
+            "track_tokens": [track_token]
+        });
+        let media: Value = self
+            .http
+            .post(MEDIA)
+            .json(&body)
+            .send()
+            .await
+            .context("cannot reach deezer media")?
+            .json()
+            .await
+            .context("cannot read deezer media")?;
+        let url = media
+            .pointer("/data/0/media/0/sources/0/url")
+            .and_then(Value::as_str)
+            .context("deezer sent no stream url")?;
+        let bytes = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .context("cannot fetch the stream")?
+            .bytes()
+            .await
+            .context("cannot read the stream")?;
+        stream::unlock(track_id, &bytes)
+    }
+
+    async fn gateway(&self, method: &str, payload: Value, token: &str) -> Result<Value> {
+        let url = format!(
+            "{GATEWAY}?method={method}&input=3&api_version=1.0&api_token={token}"
+        );
+        let body: Value = self
+            .http
+            .post(&url)
+            .json(&payload)
+            .send()
+            .await
+            .context("cannot reach deezer")?
+            .json()
+            .await
+            .context("cannot read the deezer gateway")?;
+        if let Some(error) = body.get("error")
+            && !error.is_null()
+            && error.as_array().is_none_or(|errors| !errors.is_empty())
+            && !error.as_object().is_some_and(|map| map.is_empty())
+        {
+            bail!("deezer gateway refused {method}: {error}");
+        }
+        body.get("results")
+            .cloned()
+            .context("deezer gateway sent no results")
+    }
+
+    async fn preview(&self, track_id: &str) -> Result<Vec<u8>> {
         let url = format!("{API}/track/{track_id}");
         let body: Value = self
             .http
@@ -444,15 +596,19 @@ impl Session {
             .await
             .context("cannot read the track")?;
         let preview = wire::preview(&body).context("this track has no preview")?;
-        let bytes = self
+        let response = self
             .http
             .get(&preview)
             .send()
             .await
-            .context("cannot fetch the preview")?
+            .context("cannot fetch the preview")?;
+        let bytes = response
             .bytes()
             .await
             .context("cannot read the preview")?;
+        if bytes.len() < 128 || bytes.starts_with(b"<") || bytes.starts_with(b"{") {
+            bail!("deezer preview was not audio");
+        }
         Ok(bytes.to_vec())
     }
 }

@@ -1,6 +1,7 @@
 mod auth;
 mod client;
 mod playback;
+mod stream;
 mod wire;
 
 use std::path::PathBuf;
@@ -54,8 +55,8 @@ impl DeezerProvider {
         }
     }
 
-    async fn session(&self, arl: Option<String>, user: UserProfile) -> ProviderSession {
-        let session = Arc::new(Session::new(arl));
+    fn wrap(&self, session: Session, user: UserProfile) -> ProviderSession {
+        let session = Arc::new(session);
         let authenticated = !user.id.is_empty();
         ProviderSession {
             profile: user.clone(),
@@ -70,8 +71,8 @@ impl DeezerProvider {
         let arl = auth::arl(secret)?;
         let session = Session::new(Some(arl.clone()));
         let user = session.identify().await?;
-        self.save(&Saved::Arl { arl: arl.clone() })?;
-        Ok(self.session(Some(arl), user).await)
+        self.save(&Saved::Arl { arl })?;
+        Ok(self.wrap(session, user))
     }
 
     fn guest(&self) -> ProviderSession {
@@ -122,9 +123,9 @@ impl MusicProvider for DeezerProvider {
     async fn restore(&self) -> Result<Option<ProviderSession>> {
         match self.saved() {
             Some(Saved::Arl { arl }) => {
-                let session = Session::new(Some(arl.clone()));
+                let session = Session::new(Some(arl));
                 match session.identify().await {
-                    Ok(user) => Ok(Some(self.session(Some(arl), user).await)),
+                    Ok(user) => Ok(Some(self.wrap(session, user))),
                     Err(error) => {
                         log::warn!("deezer: stored ARL was refused: {error:#}");
                         Ok(None)
